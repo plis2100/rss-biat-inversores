@@ -80,13 +80,13 @@ def escapar_xml(texto):
     )
 
 
-def descargar(url):
+def descargar_pagina():
     ultimo_error = None
 
     for intento in range(1, 4):
         try:
             respuesta = requests.get(
-                url,
+                WEB_URL,
                 headers=CABECERAS,
                 timeout=90,
                 allow_redirects=True,
@@ -94,7 +94,7 @@ def descargar(url):
             )
             respuesta.raise_for_status()
 
-            if len(respuesta.text.strip()) < 300:
+            if len(respuesta.text.strip()) < 500:
                 raise RuntimeError(
                     "BIAT Group devolvió una página incompleta"
                 )
@@ -108,26 +108,14 @@ def descargar(url):
             ultimo_error = error
 
             print(
-                f"Intento {intento} fallido para "
-                f"{url}: {error}"
+                f"Intento {intento} fallido: {error}"
             )
 
             if intento < 3:
-                time.sleep(4 * intento)
+                time.sleep(5 * intento)
 
     raise RuntimeError(
-        f"No se pudo descargar {url}: {ultimo_error}"
-    )
-
-
-def es_enlace_documento(url):
-    ruta = urlparse(url).path.lower().rstrip("/")
-
-    return bool(
-        re.match(
-            r"^/es/documento/[^/]+$",
-            ruta,
-        )
+        f"No se pudo descargar BIAT Group: {ultimo_error}"
     )
 
 
@@ -135,7 +123,7 @@ def convertir_fecha(texto):
     texto = limpiar_texto(texto).lower()
 
     coincidencia = re.search(
-        r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b",
+        r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b",
         texto,
     )
 
@@ -189,264 +177,268 @@ def convertir_fecha(texto):
     return None
 
 
-def convertir_fecha_iso(valor):
-    if not valor:
-        return None
+def es_pdf(url):
+    ruta = urlparse(url).path.lower()
+    return ruta.endswith(".pdf")
 
-    try:
-        fecha = datetime.fromisoformat(
-            valor.strip().replace("Z", "+00:00")
+
+def es_pagina_documento(url):
+    ruta = urlparse(url).path.lower().rstrip("/")
+
+    return bool(
+        re.match(
+            r"^/es/documento/[^/]+$",
+            ruta,
+        )
+    )
+
+
+def buscar_contenedor(enlace):
+    actual = enlace
+
+    for _ in range(10):
+        actual = actual.parent
+
+        if actual is None:
+            break
+
+        texto = limpiar_texto(
+            actual.get_text(" ", strip=True)
         )
 
-        if fecha.tzinfo is None:
-            fecha = fecha.replace(
-                tzinfo=timezone.utc
-            )
+        if convertir_fecha(texto) is not None:
+            if len(texto) <= 2500:
+                return actual
 
-        return fecha.astimezone(timezone.utc)
-
-    except ValueError:
-        return None
+    return enlace.parent
 
 
-def obtener_enlaces_documentos(html):
+def obtener_titulo_contenedor(
+    enlace,
+    contenedor,
+):
+    candidatos = []
+
+    for etiqueta in contenedor.find_all(
+        ["h2", "h3", "h4", "h5", "h6", "strong"]
+    ):
+        texto = limpiar_texto(
+            etiqueta.get_text(" ", strip=True)
+        )
+
+        if len(texto) >= 10:
+            if not texto.isdigit():
+                candidatos.append(texto)
+
+    for candidato in candidatos:
+        if convertir_fecha(candidato) is not None:
+            return candidato
+
+    for candidato in candidatos:
+        if candidato.lower() not in {
+            "información inversores",
+            "hechos relevantes",
+            "información financiera",
+            "junta general",
+        }:
+            return candidato
+
+    texto_enlace = limpiar_texto(
+        enlace.get_text(" ", strip=True)
+    )
+
+    if texto_enlace.lower() not in {
+        "pdf",
+        "↓ pdf",
+        "descargar",
+        "download",
+        "leer más",
+        "leer mas",
+    }:
+        if len(texto_enlace) >= 10:
+            return texto_enlace
+
+    texto = limpiar_texto(
+        contenedor.get_text(" ", strip=True)
+    )
+
+    # Elimina textos de los botones.
+    texto = re.sub(
+        r"(?:↓\s*)?PDF",
+        " ",
+        texto,
+        flags=re.IGNORECASE,
+    )
+    texto = re.sub(
+        r"\bdescargar\b",
+        " ",
+        texto,
+        flags=re.IGNORECASE,
+    )
+    texto = re.sub(
+        r"\bdownload\b",
+        " ",
+        texto,
+        flags=re.IGNORECASE,
+    )
+    texto = limpiar_texto(texto)
+
+    # Busca un título que termine con una fecha entre paréntesis.
+    coincidencia = re.search(
+        r"([^|]{10,300}?"
+        r"\(\d{1,2}[./-]\d{1,2}[./-]\d{4}\))",
+        texto,
+    )
+
+    if coincidencia:
+        titulo = limpiar_texto(
+            coincidencia.group(1)
+        )
+
+        titulo = re.sub(
+            r"^\d{4}\s+\d+\s+documentos?\s*",
+            "",
+            titulo,
+            flags=re.IGNORECASE,
+        )
+
+        return titulo
+
+    return texto[:300]
+
+
+def obtener_descripcion(
+    contenedor,
+    titulo,
+):
+    texto = limpiar_texto(
+        contenedor.get_text(" ", strip=True)
+    )
+
+    texto = texto.replace(
+        titulo,
+        " ",
+    )
+
+    texto = re.sub(
+        r"(?:↓\s*)?PDF",
+        " ",
+        texto,
+        flags=re.IGNORECASE,
+    )
+
+    texto = re.sub(
+        r"\b(?:descargar|download|leer más|leer mas)\b",
+        " ",
+        texto,
+        flags=re.IGNORECASE,
+    )
+
+    texto = limpiar_texto(texto)
+
+    if texto == titulo:
+        return ""
+
+    return texto[:1000]
+
+
+def buscar_pdf_en_contenedor(
+    contenedor,
+):
+    for enlace in contenedor.find_all(
+        "a",
+        href=True,
+    ):
+        url = urljoin(
+            BASE_URL,
+            enlace.get("href"),
+        )
+
+        if es_pdf(url):
+            return url
+
+    return ""
+
+
+def obtener_documentos(html):
     soup = BeautifulSoup(html, "html.parser")
     documentos = []
     vistos = set()
 
     for enlace in soup.find_all("a", href=True):
-        url = urljoin(
+        url_original = urljoin(
             BASE_URL,
             enlace.get("href"),
         )
-        url = url.split("#")[0].split("?")[0].rstrip("/")
+        url_original = url_original.split("#")[0]
 
-        if not es_enlace_documento(url):
+        if not (
+            es_pdf(url_original)
+            or es_pagina_documento(url_original)
+        ):
             continue
 
-        if url in vistos:
+        contenedor = buscar_contenedor(enlace)
+
+        if contenedor is None:
             continue
 
-        titulo = limpiar_texto(
-            enlace.get_text(" ", strip=True)
+        texto_contenedor = limpiar_texto(
+            contenedor.get_text(" ", strip=True)
         )
 
-        if titulo.lower() in {
-            "pdf",
-            "↓ pdf",
-            "descargar",
-            "leer más",
-            "leer mas",
-        }:
-            titulo = ""
+        fecha = convertir_fecha(
+            texto_contenedor
+        )
+
+        if fecha is None:
+            fecha = convertir_fecha(
+                enlace.get("title", "")
+            )
+
+        if fecha is None:
+            continue
+
+        titulo = obtener_titulo_contenedor(
+            enlace,
+            contenedor,
+        )
+
+        if len(titulo) < 10:
+            continue
+
+        pdf = ""
+
+        if es_pdf(url_original):
+            pdf = url_original
+        else:
+            pdf = buscar_pdf_en_contenedor(
+                contenedor
+            )
+
+        url_item = pdf or url_original
+        guid = url_original.rstrip("/")
+
+        if guid in vistos:
+            continue
+
+        descripcion = obtener_descripcion(
+            contenedor,
+            titulo,
+        )
 
         documentos.append(
             {
-                "url_detalle": url,
-                "titulo_inicial": titulo,
+                "titulo": titulo,
+                "url": url_item,
+                "guid": guid,
+                "fecha": fecha,
+                "descripcion": descripcion,
+                "pdf": pdf,
             }
         )
 
-        vistos.add(url)
-
-    if not documentos:
-        raise RuntimeError(
-            "No se encontraron documentos para inversores "
-            "de BIAT Group"
-        )
-
-    # La página está ordenada de más reciente a más antiguo.
-    return documentos[:80]
-
-
-def obtener_fecha(soup, texto, titulo):
-    fecha = convertir_fecha(titulo)
-
-    if fecha:
-        return fecha
-
-    fecha = convertir_fecha(texto)
-
-    if fecha:
-        return fecha
-
-    meta = soup.find(
-        "meta",
-        attrs={"property": "article:published_time"},
-    )
-
-    if meta and meta.get("content"):
-        fecha = convertir_fecha_iso(
-            meta.get("content")
-        )
-
-        if fecha:
-            return fecha
-
-    tiempo = soup.find("time")
-
-    if tiempo:
-        fecha = convertir_fecha_iso(
-            tiempo.get("datetime")
-        )
-
-        if fecha:
-            return fecha
-
-        fecha = convertir_fecha(
-            tiempo.get_text(" ", strip=True)
-        )
-
-        if fecha:
-            return fecha
-
-    return datetime.now(timezone.utc)
-
-
-def buscar_pdf(soup, url_detalle):
-    for enlace in soup.find_all("a", href=True):
-        href = urljoin(
-            url_detalle,
-            enlace.get("href"),
-        )
-
-        ruta = urlparse(href).path.lower()
-
-        if ruta.endswith(".pdf"):
-            return href
-
-    return ""
-
-
-def obtener_descripcion(soup):
-    meta = soup.find(
-        "meta",
-        attrs={"name": "description"},
-    )
-
-    if meta and meta.get("content"):
-        descripcion = limpiar_texto(
-            meta.get("content")
-        )
-
-        texto_generico = (
-            "biat group es un grupo empresarial líder"
-        )
-
-        if (
-            len(descripcion) >= 40
-            and texto_generico not in descripcion.lower()
-        ):
-            return descripcion[:1200]
-
-    for selector in [
-        "article p",
-        "main p",
-        ".post-content p",
-        ".entry-content p",
-    ]:
-        parrafos = soup.select(selector)
-
-        textos = [
-            limpiar_texto(
-                parrafo.get_text(" ", strip=True)
-            )
-            for parrafo in parrafos
-        ]
-
-        textos = [
-            texto
-            for texto in textos
-            if len(texto) >= 40
-        ]
-
-        if textos:
-            return " ".join(textos)[:1200]
-
-    return ""
-
-
-def completar_documento(documento):
-    html = descargar(
-        documento["url_detalle"]
-    )
-    soup = BeautifulSoup(html, "html.parser")
-
-    encabezado = soup.find("h1")
-
-    if encabezado:
-        titulo = limpiar_texto(
-            encabezado.get_text(" ", strip=True)
-        )
-    else:
-        titulo = documento["titulo_inicial"]
-
-    if len(titulo) < 10:
-        titulo = documento["titulo_inicial"]
-
-    if len(titulo) < 10:
-        titulo = urlparse(
-            documento["url_detalle"]
-        ).path.rstrip("/").split("/")[-1]
-
-        titulo = limpiar_texto(
-            titulo.replace("-", " ")
-        ).title()
-
-    texto_pagina = limpiar_texto(
-        soup.get_text(" ", strip=True)
-    )
-
-    fecha = obtener_fecha(
-        soup,
-        texto_pagina,
-        titulo,
-    )
-
-    pdf = buscar_pdf(
-        soup,
-        documento["url_detalle"],
-    )
-
-    descripcion = obtener_descripcion(soup)
-
-    if pdf:
-        descripcion_pdf = (
-            f"Documento PDF: {pdf}"
-        )
-
-        if descripcion:
-            descripcion = (
-                descripcion + " " + descripcion_pdf
-            )[:1500]
-        else:
-            descripcion = descripcion_pdf
-
-    return {
-        "titulo": titulo,
-        "url": pdf or documento["url_detalle"],
-        "guid": documento["url_detalle"],
-        "fecha": fecha,
-        "descripcion": descripcion,
-        "pdf": pdf,
-    }
-
-
-def obtener_documentos():
-    html = descargar(WEB_URL)
-    enlaces = obtener_enlaces_documentos(html)
-    documentos = []
-
-    for enlace in enlaces:
-        try:
-            documentos.append(
-                completar_documento(enlace)
-            )
-        except Exception as error:
-            print(
-                f"No se pudo completar "
-                f"{enlace['url_detalle']}: {error}"
-            )
+        vistos.add(guid)
 
     documentos.sort(
         key=lambda documento: documento["fecha"],
@@ -455,11 +447,11 @@ def obtener_documentos():
 
     if not documentos:
         raise RuntimeError(
-            "No se pudieron obtener documentos "
-            "para inversores de BIAT Group"
+            "No se encontraron documentos para "
+            "inversores de BIAT Group"
         )
 
-    return documentos[:60]
+    return documentos[:100]
 
 
 def crear_rss(documentos):
@@ -469,7 +461,10 @@ def crear_rss(documentos):
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<rss version="2.0">',
         "<channel>",
-        "<title>BIAT Group - Información para inversores</title>",
+        (
+            "<title>BIAT Group - Información "
+            "para inversores</title>"
+        ),
         f"<link>{escapar_xml(WEB_URL)}</link>",
         (
             "<description>Documentos, comunicaciones y "
@@ -534,7 +529,9 @@ def crear_rss(documentos):
 
 
 def guardar_rss(contenido):
-    temporal = ARCHIVO_RSS.with_suffix(".xml.tmp")
+    temporal = ARCHIVO_RSS.with_suffix(
+        ".xml.tmp"
+    )
 
     temporal.write_text(
         contenido,
@@ -547,12 +544,13 @@ def guardar_rss(contenido):
 
 
 def main():
-    documentos = obtener_documentos()
+    html = descargar_pagina()
+    documentos = obtener_documentos(html)
     contenido = crear_rss(documentos)
     guardar_rss(contenido)
 
     print(
-        f"RSS de BIAT Group creada correctamente con "
+        f"RSS de BIAT Group creada con "
         f"{len(documentos)} documentos"
     )
 
